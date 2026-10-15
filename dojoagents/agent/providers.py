@@ -2,6 +2,7 @@ import json
 import math
 import re
 from urllib.parse import urlsplit, urlunsplit
+
 import httpx
 from typing import Any, Protocol, Callable
 from dojoagents.agent.context_length import ContextLengthExceededError, parse_context_length_error
@@ -36,7 +37,8 @@ def redact_provider_response(value: Any, secret: str = "") -> Any:
 
 class _BoundedResponseStream(httpx.AsyncByteStream):
     def __init__(self, stream: httpx.AsyncByteStream, limit: int):
-        self.stream, self.limit = stream, limit
+        self.stream = stream
+        self.limit = limit
 
     async def __aiter__(self):
         size = 0
@@ -208,7 +210,9 @@ class OpenAICompatibleProvider:
             raise ValueError("timeout must be finite and positive")
         if max_response_bytes is not None and (type(max_response_bytes) is not int or max_response_bytes <= 0):
             raise ValueError("max_response_bytes must be a positive integer")
-        self.max_retries, self.timeout, self.max_response_bytes = max_retries, timeout, max_response_bytes
+        self.max_retries = max_retries
+        self.timeout = timeout
+        self.max_response_bytes = max_response_bytes
 
     async def _raw_completion(self, client, create_kwargs) -> LLMResult:
         from openai import APIStatusError
@@ -220,7 +224,10 @@ class OpenAICompatibleProvider:
             response = exc.response
         text = response.content.decode("utf-8", errors="backslashreplace")
         try:
-            body = json.loads(text, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+            body = json.loads(
+                text,
+                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+            )
         except (ValueError, RecursionError):
             body = {"_unparsed_response": text}
         body = redact_provider_response(body, self.api_key or "")
@@ -235,7 +242,10 @@ class OpenAICompatibleProvider:
         }
         if isinstance(body, dict) and isinstance(body.get("usage"), dict):
             metadata["usage"] = body["usage"]
-        return LLMResult(content=content if isinstance(content, str) else "", metadata=metadata)
+        return LLMResult(
+            content=content if isinstance(content, str) else "",
+            metadata=metadata,
+        )
 
     @staticmethod
     def _usage_dict(usage: Any) -> dict[str, int] | None:
@@ -278,17 +288,28 @@ class OpenAICompatibleProvider:
         if include_raw_response and stream:
             raise ValueError("Raw receipts require a non-streaming call")
         options = dict(request_options or {})
-        allowed = {"temperature", "max_completion_tokens", "max_tokens", "response_format", "extra_body"}
+        allowed = {
+            "temperature",
+            "max_completion_tokens",
+            "max_tokens",
+            "response_format",
+            "extra_body",
+        }
         if set(options) - allowed:
             raise ValueError("Unsupported chat request options")
-        extra_body = {**((metadata or {}).get("_dojo_extra_body") or {}), **(options.get("extra_body") or {})}
+        extra_body = {
+            **((metadata or {}).get("_dojo_extra_body") or {}),
+            **(options.get("extra_body") or {}),
+        }
         if set(extra_body) & {"model", "messages", "tools", "stream"}:
             raise ValueError("extra_body cannot override the chat request identity")
         if extra_body:
             options["extra_body"] = extra_body
         if "max_completion_tokens" in options:
-            # Older supported SDKs accept this newer API field through extra_body.
-            options["extra_body"] = {**extra_body, "max_completion_tokens": options.pop("max_completion_tokens")}
+            options["extra_body"] = {
+                **extra_body,
+                "max_completion_tokens": options.pop("max_completion_tokens"),
+            }
         if not self.api_key:
             return LLMResult(
                 content=("OpenAI-compatible provider is configured without an API key. " "Set the configured api_key_env before making live calls."),
@@ -385,6 +406,8 @@ class OpenAICompatibleProvider:
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
+                if event_sink is not None:
+                    await event_sink.wait_for_capacity()
                 reasoning_delta = getattr(delta, "reasoning_content", None) or (
                     delta.model_extra.get("reasoning_content") if hasattr(delta, "model_extra") and delta.model_extra else None
                 )
@@ -417,6 +440,7 @@ class OpenAICompatibleProvider:
                         tool_calls_buffer[idx]["metadata"].update(_extract_tool_call_metadata(tc_delta, self.name))
 
             if event_sink is not None and reasoning_started and not reasoning_ended:
+                await event_sink.wait_for_capacity()
                 event_sink.thinking_end()
                 reasoning_ended = True
             final_tool_calls = []

@@ -1,13 +1,17 @@
 from __future__ import annotations
-import asyncio
+
 import inspect
+import json
+import logging
 from dataclasses import dataclass
 from typing import Any, Generic, TypeVar
-import pandas as pd
+
 import httpx
+import pandas as pd
 
 from dojoagents.logging import LOGGER
 from dojoagents.dashboard.schemas.freshness import DataSource
+from dojoagents.utils.async_runtime import gather_ordered
 
 T = TypeVar("T")
 
@@ -183,7 +187,7 @@ class DojoDataGateway:
     async def _call(self, operation: str, awaitable: Any) -> Any:
         try:
             return await awaitable
-        except (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException) as exc:
+        except (TimeoutError, httpx.TimeoutException) as exc:
             raise GatewayTimeoutError(f"{operation}: upstream request timed out") from exc
         except (ConnectionError, httpx.NetworkError) as exc:
             raise GatewayUnavailableError(f"{operation}: upstream source is unavailable") from exc
@@ -257,6 +261,12 @@ class DojoDataGateway:
         kwargs = {key: value for key, value in window.items() if value is not None}
         kwargs.pop("market", None)
         online = getattr(self.client, "_online", None)
+        LOGGER.debug(
+            "dojo_kline_route route=%s symbols=%d window=%s",
+            "offline_batch" if online is False else "online_per_symbol",
+            len(canonical_symbols),
+            kwargs,
+        )
         if online is not False:
             return await self._fetch_klines_per_symbol(canonical_symbols, kwargs)
         return await self._fetch_offline_kline_batch(canonical_symbols, kwargs)
@@ -269,9 +279,7 @@ class DojoDataGateway:
         limit = kwargs.get("limit")
         requested_fields = kwargs.get("fields")
         fields = (
-            list(dict.fromkeys(str(field).strip() for field in requested_fields if str(field).strip()))
-            if isinstance(requested_fields, (list, tuple))
-            else list(KLINE_QUERY_FIELDS)
+            list(dict.fromkeys(str(field).strip() for field in requested_fields if str(field).strip())) if isinstance(requested_fields, (list, tuple)) else list(KLINE_QUERY_FIELDS)
         )
         payload = await self._call(
             "stock_klines",
@@ -300,27 +308,47 @@ class DojoDataGateway:
         return _df_result(frame, snapshot=normalized_snapshot)
 
     async def _fetch_kline_rows(self, symbols: list[str], kwargs: dict[str, Any]) -> list[dict[str, Any]]:
-        semaphore = asyncio.Semaphore(self.kline_max_concurrent)
-
         async def fetch_one(symbol: str) -> list[dict[str, Any]]:
-            async with semaphore:
-                payload = await self._call(
-                    "stock_klines",
-                    self.client.stocks.get_kline(symbol=symbol, **kwargs),
-                )
+            payload = await self._call(
+                "stock_klines",
+                self.client.stocks.get_kline(symbol=symbol, **kwargs),
+            )
             result = _list_result(payload, "stock_klines", "klines")
+            if LOGGER.isEnabledFor(logging.DEBUG) and symbol in symbols[:3]:
+                sample = []
+                for row in (result.data[:1] + result.data[-1:] if len(result.data) > 1 else result.data):
+                    raw_time = row.get("bar_time") or row.get("date") or row.get("datetime")
+                    sample.append({"bar_time": raw_time, "bar_time_type": type(raw_time).__name__, "close": row.get("close")})
+                raw_times = [str(row.get("bar_time") or row.get("date") or row.get("datetime")) for row in result.data]
+                LOGGER.debug(
+                    "dojo_kline_raw_sample symbol=%s rows=%d raw_min=%s raw_max=%s sample=%s",
+                    symbol,
+                    len(result.data),
+                    min(raw_times, default=None),
+                    max(raw_times, default=None),
+                    json.dumps(sample, default=str),
+                )
             return result.data
 
-        results = await asyncio.gather(*(fetch_one(symbol) for symbol in symbols), return_exceptions=True)
+        results = await gather_ordered(
+            [lambda symbol=symbol: fetch_one(symbol) for symbol in symbols],
+            max_concurrency=self.kline_max_concurrent,
+            return_exceptions=True,
+        )
         rows: list[dict[str, Any]] = []
         failures = 0
-        for result in results:
+        failure_sample = []
+        for symbol, result in zip(symbols, results):
             if isinstance(result, Exception):
                 failures += 1
+                if len(failure_sample) < 3:
+                    failure_sample.append({"symbol": symbol, "error_type": type(result).__name__})
                 continue
             rows.extend(result)
         if failures:
             LOGGER.warning("Failed to fetch %d/%d stock K-lines", failures, len(symbols))
+            LOGGER.debug("dojo_kline_failures count=%d sample=%s", failures, failure_sample)
+        LOGGER.debug("dojo_kline_response requested_symbols=%d returned_rows=%d failures=%d", len(symbols), len(rows), failures)
         return rows
 
     async def _fetch_klines_per_symbol(
@@ -367,12 +395,8 @@ class DojoDataGateway:
         kwargs = {"symbol": _canonical_symbol(symbol), "page": page, "page_size": page_size}
         payload, used_live = await self._call_realtime(
             "stock_events",
-            lambda: self.live_client.stocks.get_event_remind(
-                **{key: value for key, value in kwargs.items() if value is not None}
-            ),
-            lambda: self.client.stocks.get_event_remind(
-                **{key: value for key, value in kwargs.items() if value is not None}
-            ),
+            lambda: self.live_client.stocks.get_event_remind(**{key: value for key, value in kwargs.items() if value is not None}),
+            lambda: self.client.stocks.get_event_remind(**{key: value for key, value in kwargs.items() if value is not None}),
         )
         result = _list_result(payload, "stock_events", "data")
         if used_live:
@@ -393,12 +417,8 @@ class DojoDataGateway:
         kwargs = {"symbol": _canonical_symbol(symbol), "page": page, "page_size": page_size}
         payload, used_live = await self._call_realtime(
             "stock_news",
-            lambda: self.live_client.stocks.get_news(
-                **{key: value for key, value in kwargs.items() if value is not None}
-            ),
-            lambda: self.client.stocks.get_news(
-                **{key: value for key, value in kwargs.items() if value is not None}
-            ),
+            lambda: self.live_client.stocks.get_news(**{key: value for key, value in kwargs.items() if value is not None}),
+            lambda: self.client.stocks.get_news(**{key: value for key, value in kwargs.items() if value is not None}),
         )
         result = _list_result(payload, "stock_news", "news")
         if used_live:
