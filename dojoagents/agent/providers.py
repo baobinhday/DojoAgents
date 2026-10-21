@@ -10,6 +10,7 @@ from dojoagents.agent.context_length import ContextLengthExceededError, parse_co
 from dojoagents.logging import LOGGER
 from dojoagents.agent.models import LLMResult, ToolCall
 from dojoagents.agent.events import emit_stream_delta
+from dojoagents.agent.telemetry import LLMCallEvent, current_run_id, emit
 
 _REDACTED_PROVIDER_KEYS = {"thought_signature", "thoughtSignature", "reasoningSignature", "signature"}
 _IMAGE_DATA_URL_RE = re.compile(r"^data:(image/[a-zA-Z0-9.+-]+);base64,(.*)$", re.DOTALL)
@@ -351,6 +352,8 @@ class OpenAICompatibleProvider:
         if is_model_router and self.author and not model.startswith(f"{self.author}/"):
             actual_model = f"{self.author}/{model}"
 
+        request_started = time.perf_counter()
+        request_started_wall = time.time()
         try:
             create_kwargs: dict[str, Any] = {
                 "model": actual_model,
@@ -405,6 +408,11 @@ class OpenAICompatibleProvider:
             pending_text: list[str] = []
             reasoning_chars = text_chars = 0
             last_reasoning_flush = last_text_flush = time.monotonic()
+            # Stream timing markers must exist before the loop: they are read on
+            # every chunk, so a missing initializer raises UnboundLocalError.
+            first_chunk_at: float | None = None
+            first_content_at: float | None = None
+            last_chunk_at: float | None = None
 
             async def flush_reasoning() -> None:
                 nonlocal reasoning_chars, last_reasoning_flush
@@ -429,6 +437,11 @@ class OpenAICompatibleProvider:
                     stream_usage = chunk_usage
                 if not chunk.choices:
                     continue
+                last_chunk_at = time.perf_counter()
+                if first_chunk_at is None:
+                    # Reasoning chunks count as the first token: users still wait
+                    # for them, and providers bill them.
+                    first_chunk_at = last_chunk_at
                 choice = chunk.choices[0]
                 delta = choice.delta
                 if event_sink is not None:
@@ -451,6 +464,8 @@ class OpenAICompatibleProvider:
                             event_sink.thinking_delta(reasoning_delta)
                 content_delta = delta.content or ""
                 if content_delta:
+                    if first_content_at is None:
+                        first_content_at = time.perf_counter()
                     if event_sink is not None and reasoning_started and not reasoning_ended:
                         await flush_reasoning()
                         event_sink.thinking_end()
@@ -503,6 +518,32 @@ class OpenAICompatibleProvider:
                 metadata["usage"] = stream_usage
             else:
                 metadata["usage_available"] = False
+            # Timing no longer rides a private metadata channel; the framework
+            # emits a neutral LLMCallEvent instead and the host persists it.
+            stream_ended = time.perf_counter()
+            timing: dict[str, int] = {"request_ms": int((stream_ended - request_started) * 1000)}
+            if first_chunk_at is not None:
+                timing["ttft_ms"] = int((first_chunk_at - request_started) * 1000)
+            if first_content_at is not None:
+                timing["ttfc_ms"] = int((first_content_at - request_started) * 1000)
+            if first_chunk_at is not None and last_chunk_at is not None:
+                timing["decode_ms"] = int((last_chunk_at - first_chunk_at) * 1000)
+            # Framework-neutral telemetry event; the host decides how to persist
+            # it. run_id comes from the run-scoped context (see telemetry.py).
+            emit(
+                LLMCallEvent(
+                    run_id=current_run_id(),
+                    model=actual_model,
+                    provider=self.name,
+                    started_at=request_started_wall,
+                    request_ms=timing.get("request_ms", 0),
+                    ttft_ms=timing.get("ttft_ms"),
+                    ttfc_ms=timing.get("ttfc_ms"),
+                    decode_ms=timing.get("decode_ms"),
+                    usage=stream_usage,
+                    status="succeeded",
+                )
+            )
             return LLMResult(
                 content="".join(full_content),
                 tool_calls=final_tool_calls,
@@ -532,6 +573,17 @@ class OpenAICompatibleProvider:
                 result_metadata["usage"] = usage_dict
             else:
                 result_metadata["usage_available"] = False
+            emit(
+                LLMCallEvent(
+                    run_id=current_run_id(),
+                    model=actual_model,
+                    provider=self.name,
+                    started_at=request_started_wall,
+                    request_ms=max(0, int((time.perf_counter() - request_started) * 1000)),
+                    usage=usage_dict,
+                    status="succeeded",
+                )
+            )
             return LLMResult(
                 content=message.content or "",
                 tool_calls=final_tool_calls,
